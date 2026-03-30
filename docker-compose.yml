@@ -3,6 +3,33 @@ services:
     build: .
     ports:
       - "8000:8000"
-    volumes:
-      - .:/app
+    env_file:
+      - .env
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: .
+    env_file:
+      - .env
+    command: python worker/sqs.py
+    depends_on:
+      - api
+
+  chunker:
+    build: .
+    env_file:
+      - .env
+    command: python worker/chunker.py
+
+  embedder:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - CHROMA_PATH=/chroma_db
+    volumes:
+      - chroma_data:/chroma_db
+    command: python worker/embedder.py
+
+volumes:
+  chroma_data:
