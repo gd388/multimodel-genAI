@@ -2,6 +2,9 @@ fastapi
 uvicorn
 boto3
 python-dotenv
-docling
-sentence-transformers
-chromadb
+python-multipart
+groq
+google-generativeai
+requests
+streamlit
+pandas

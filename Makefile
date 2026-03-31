@@ -1,5 +1,7 @@
 PYTHON = .venv/bin/python
 PIP = .venv/bin/pip
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 up:
@@ -16,6 +18,9 @@ logs:
 
 restart:
 	docker compose restart
+
+prune:
+	docker system prune -a
 
 # ── Local dev (no Docker) ─────────────────────────────────────────────────────
 api:
@@ -54,5 +59,7 @@ backfill-chunks:
 
 backfill-embeddings:
 	$(PYTHON) worker/backfill_embeddings.py
+
+
 
 .PHONY: up up-detach down logs restart api worker chunker embedder install check-queue backfill-metadata backfill-chunks backfill-embeddings

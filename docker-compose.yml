@@ -1,35 +1,79 @@
 services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
   api:
     build: .
+    image: multimodel-genai:latest
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - QDRANT_HOST=qdrant
+    volumes:
+      - fastembed_cache:/root/.cache/fastembed
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    depends_on:
+      - qdrant
 
   worker:
-    build: .
+    image: multimodel-genai:latest
     env_file:
       - .env
+    environment:
+      - PYTHONUNBUFFERED=1
     command: python worker/sqs.py
     depends_on:
       - api
 
   chunker:
-    build: .
-    env_file:
-      - .env
-    command: python worker/chunker.py
-
-  embedder:
-    build: .
+    image: multimodel-genai:latest
     env_file:
       - .env
     environment:
-      - CHROMA_PATH=/chroma_db
+      - PYTHONUNBUFFERED=1
+    command: python worker/chunker.py
+
+  embedder:
+    image: multimodel-genai:latest
+    env_file:
+      - .env
+    environment:
+      - QDRANT_HOST=qdrant
+      - PYTHONUNBUFFERED=1
     volumes:
-      - chroma_data:/chroma_db
+      - fastembed_cache:/root/.cache/fastembed
     command: python worker/embedder.py
+    depends_on:
+      - qdrant
+
+  streamlit:
+    image: multimodel-genai:latest
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - QDRANT_HOST=qdrant
+      - API_URL=http://api:8000
+    command: streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+    depends_on:
+      api:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
 
 volumes:
-  chroma_data:
+  qdrant_data:
+  fastembed_cache:

@@ -1,158 +1,182 @@
 # worker/embedder.py
-# Polls S3 for embed trigger files written by chunker.py.
-# For each trigger:
-#   1. Reads chunks JSON from S3 (dev/chunks/)
-#   2. Generates 768-dim BGE embeddings via sentence-transformers
-#   3. Stores in ChromaDB (persistent, one collection per doc)
-#   4. Saves embedding vectors + metadata to S3 (dev/embeddings/)
+# Stage 3: Polls the embed-queue SQS, reads chunks from S3 (staging),
+# extracts doc metadata from parsed markdown, generates BGE embeddings,
+# upserts into Qdrant with full metadata payload, then deletes S3 staging files.
+# Qdrant is the single source of truth — no permanent intermediate S3 data.
 
 import boto3
-import chromadb
 import json
 import os
-import time
+import re
+import uuid
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
 
 load_dotenv()
 
 BUCKET          = "genai-rag-bucket-gd"
-TRIGGER_PREFIX  = "dev/triggers/embed/"
 CHUNKS_PREFIX   = "dev/chunks/"
-EMBEDDINGS_PREFIX = "dev/embeddings/"
+PARSED_PREFIX   = "dev/parsed/"
+EMBED_QUEUE_URL = os.getenv("SQS_EMBED_URL")
 AWS_REGION      = os.getenv("AWS_REGION", "us-east-1")
-CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
-POLL_INTERVAL   = 10
-BATCH_SIZE      = 64   # chunks per embedding batch
 BGE_MODEL       = "BAAI/bge-base-en-v1.5"
+DIMENSION       = 768
+COLLECTION      = "documents"
 
-print(f"[INIT] Loading BGE model: {BGE_MODEL}")
-model = SentenceTransformer(BGE_MODEL)
-print(f"[INIT] Model loaded. Embedding dim: {model.get_sentence_embedding_dimension()}")
+BATCH_SIZE = 32
 
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-print(f"[INIT] ChromaDB initialized at: {CHROMA_PATH}")
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def collection_name_from_key(chunks_key: str) -> str:
-    """Derive a safe ChromaDB collection name from S3 key."""
-    name = chunks_key.removeprefix(CHUNKS_PREFIX).replace("/", "_").replace(" ", "_")
-    # ChromaDB collection names: 3-63 chars, alphanumeric + underscore + hyphen
-    name = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name)
-    return name[:63] if len(name) > 63 else name
+print(f"[INIT] Loading BGE model: {BGE_MODEL} (fastembed/ONNX, batch={BATCH_SIZE})")
+model = TextEmbedding(BGE_MODEL)
+print(f"[INIT] Model loaded. Embedding dim: {DIMENSION}")
 
 
+# ── Qdrant client ─────────────────────────────────────────────────────────────
+qdrant = QdrantClient(
+    host=os.getenv("QDRANT_HOST", "localhost"),
+    port=int(os.getenv("QDRANT_PORT", 6333)),
+)
+
+existing = [c.name for c in qdrant.get_collections().collections]
+if COLLECTION not in existing:
+    qdrant.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(size=DIMENSION, distance=Distance.COSINE),
+    )
+    print(f"[QDRANT] Created collection '{COLLECTION}'")
+else:
+    print(f"[QDRANT] Collection '{COLLECTION}' ready")
+
+
+# ── Metadata extraction ───────────────────────────────────────────────────────
+_DATE_RE = re.compile(
+    r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)'
+    r'\s+\d{1,2},?\s+\d{4}'
+    r'|\b\d{4}-\d{2}-\d{2}\b'
+    r'|\bQ[1-4]\s+\d{4}\b',
+    re.IGNORECASE,
+)
+
+def extract_doc_metadata(markdown: str, source_key: str) -> dict:
+    lines = markdown.splitlines()
+    title = ""
+    for line in lines:
+        s = line.strip()
+        if s.startswith("#"):
+            title = s.lstrip("#").strip(); break
+        elif s:
+            title = s; break
+    sections = [l.lstrip("#").strip() for l in lines if l.startswith("## ")]
+    dates    = list(dict.fromkeys(_DATE_RE.findall(markdown)))[:10]
+    return {
+        "source_key": source_key,
+        "title":      title,
+        "sections":   sections,
+        "dates":      dates,
+        "word_count": len(markdown.split()),
+    }
+
+
+# ── Embedding ─────────────────────────────────────────────────────────────────
 def embed_in_batches(texts: list[str]) -> list[list[float]]:
-    """Embed texts in batches, return list of vectors."""
-    all_vectors = []
+    all_vecs = []
+    total    = (len(texts) - 1) // BATCH_SIZE + 1
     for i in range(0, len(texts), BATCH_SIZE):
         batch = texts[i : i + BATCH_SIZE]
-        # BGE instruction prefix improves retrieval quality
-        prefixed = [f"Represent this financial document passage: {t}" for t in batch]
-        vecs = model.encode(prefixed, normalize_embeddings=True)
-        all_vectors.extend(vecs.tolist())
-        print(f"[EMBED] Batch {i // BATCH_SIZE + 1}: {len(batch)} chunks embedded")
-    return all_vectors
+        vecs  = list(model.embed(batch))
+        all_vecs.extend([v.tolist() for v in vecs])
+        print(f"[EMBED] Batch {i // BATCH_SIZE + 1}/{total}: {len(batch)} chunks")
+    return all_vecs
 
 
 # ── Main processor ────────────────────────────────────────────────────────────
+def process_message(s3, msg):
+    body       = json.loads(msg["Body"])
+    chunks_key = body["chunks_key"]
+    bucket     = body.get("bucket", BUCKET)
 
-def process_trigger(s3, trigger_key: str):
-    print(f"[TRIGGER] Found: s3://{BUCKET}/{trigger_key}")
-
-    obj = s3.get_object(Bucket=BUCKET, Key=trigger_key)
-    chunks_key = obj["Body"].read().decode("utf-8").strip()
-
-    print(f"[READ]  s3://{BUCKET}/{chunks_key}")
-    chunks_obj = s3.get_object(Bucket=BUCKET, Key=chunks_key)
-    data = json.loads(chunks_obj["Body"].read())
-    chunks = data.get("chunks", [])
+    print(f"[READ]   s3://{bucket}/{chunks_key}")
+    chunks_obj = s3.get_object(Bucket=bucket, Key=chunks_key)
+    data       = json.loads(chunks_obj["Body"].read())
+    chunks     = data.get("chunks", [])
 
     if not chunks:
         print(f"[SKIP] No chunks in {chunks_key}")
-        s3.delete_object(Bucket=BUCKET, Key=trigger_key)
         return
 
-    print(f"[EMBED] Embedding {len(chunks)} chunks from {chunks_key}")
+    # Load parsed markdown to extract doc-level metadata
+    doc_meta   = {}
+    parsed_key = chunks_key.replace(CHUNKS_PREFIX, PARSED_PREFIX)
+    try:
+        parsed_obj  = s3.get_object(Bucket=bucket, Key=parsed_key)
+        parsed_data = json.loads(parsed_obj["Body"].read())
+        doc_meta    = extract_doc_metadata(parsed_data.get("markdown", ""), chunks_key)
+        print(f"[META]  title='{doc_meta.get('title', '')}' | "
+              f"dates={doc_meta.get('dates', [])} | "
+              f"sections={len(doc_meta.get('sections', []))}")
+    except Exception as e:
+        print(f"[META]  Could not load parsed markdown: {e}")
 
-    texts    = [c["content"] for c in chunks]
-    vectors  = embed_in_batches(texts)
+    print(f"[EMBED] Embedding {len(chunks)} chunks ...")
+    texts   = [c["content"] for c in chunks]
+    vectors = embed_in_batches(texts)
 
-    # ── ChromaDB ──────────────────────────────────────────────────────────────
-    col_name = collection_name_from_key(chunks_key)
-    collection = chroma_client.get_or_create_collection(
-        name=col_name,
-        metadata={"hnsw:space": "cosine"}
-    )
+    # ── Qdrant upsert — chunk content + doc metadata as payload ──────────────
+    points = [
+        PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vectors[i],
+            payload={
+                "chunk_index":    c["chunk_index"],
+                "section":        c["section"],
+                "type":           c["type"],
+                "content":        c["content"],
+                "source_key":     chunks_key,
+                "doc_title":      doc_meta.get("title", ""),
+                "doc_sections":   doc_meta.get("sections", []),
+                "doc_dates":      doc_meta.get("dates", []),
+                "doc_word_count": doc_meta.get("word_count", 0),
+            },
+        )
+        for i, c in enumerate(chunks)
+    ]
+    qdrant.upsert(collection_name=COLLECTION, points=points)
+    print(f"[QDRANT] Upserted {len(points)} points into '{COLLECTION}'")
 
-    collection.upsert(
-        ids=[f"{col_name}_{c['chunk_index']}" for c in chunks],
-        embeddings=vectors,
-        documents=texts,
-        metadatas=[{
-            "section":     c["section"],
-            "type":        c["type"],
-            "chunk_index": c["chunk_index"],
-            "source_key":  chunks_key,
-        } for c in chunks],
-    )
-    print(f"[CHROMA] Upserted {len(chunks)} chunks → collection '{col_name}'")
+    # ── Delete S3 staging files — Qdrant is now source of truth ──────────────
+    for key in [chunks_key, parsed_key]:
+        try:
+            s3.delete_object(Bucket=bucket, Key=key)
+            print(f"[CLEAN] Deleted staging: s3://{bucket}/{key}")
+        except Exception as e:
+            print(f"[WARN]  Could not delete {key}: {e}")
 
-    # ── S3 embeddings backup ──────────────────────────────────────────────────
-    embeddings_payload = {
-        "source_chunks_key": chunks_key,
-        "chroma_collection":  col_name,
-        "model": BGE_MODEL,
-        "dimensions": 768,
-        "count": len(chunks),
-        "embeddings": [
-            {
-                "chunk_index": c["chunk_index"],
-                "section":     c["section"],
-                "type":        c["type"],
-                "content":     c["content"],
-                "vector":      vectors[i],
-            }
-            for i, c in enumerate(chunks)
-        ]
-    }
-
-    embeddings_key = chunks_key.replace(CHUNKS_PREFIX, EMBEDDINGS_PREFIX)
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=embeddings_key,
-        Body=json.dumps(embeddings_payload, ensure_ascii=False),
-    )
-    print(f"[SAVED] s3://{BUCKET}/{embeddings_key}")
-
-    s3.delete_object(Bucket=BUCKET, Key=trigger_key)
-    print(f"[DONE]  Trigger deleted: {trigger_key}\n")
+    print(f"[DONE]  {chunks_key} embedded and staging cleaned\n")
 
 
 # ── Polling loop ──────────────────────────────────────────────────────────────
-
 def poll():
-    s3 = boto3.client("s3", region_name=AWS_REGION)
-    print(f"[START] Embedder polling s3://{BUCKET}/{TRIGGER_PREFIX} every {POLL_INTERVAL}s")
+    s3  = boto3.client("s3", region_name=AWS_REGION)
+    sqs = boto3.client("sqs", region_name=AWS_REGION)
+    print(f"[START] Embedder polling embed-queue: {EMBED_QUEUE_URL}")
 
     while True:
-        paginator = s3.get_paginator("list_objects_v2")
-        found = False
-        for page in paginator.paginate(Bucket=BUCKET, Prefix=TRIGGER_PREFIX):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".txt"):
-                    found = True
-                    try:
-                        process_trigger(s3, key)
-                    except Exception as e:
-                        print(f"[ERROR] {key}: {e}")
-
-        if not found:
-            print(f"[POLL]  No embed triggers, sleeping {POLL_INTERVAL}s ...")
-        time.sleep(POLL_INTERVAL)
+        response = sqs.receive_message(
+            QueueUrl=EMBED_QUEUE_URL,
+            MaxNumberOfMessages=5,
+            WaitTimeSeconds=10,
+        )
+        for msg in response.get("Messages", []):
+            try:
+                process_message(s3, msg)
+            except Exception as e:
+                print(f"[ERROR] {e}")
+            finally:
+                sqs.delete_message(
+                    QueueUrl=EMBED_QUEUE_URL,
+                    ReceiptHandle=msg["ReceiptHandle"],
+                )
 
 
 if __name__ == "__main__":

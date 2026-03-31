@@ -1,26 +1,24 @@
 # worker/chunker.py
-# Polls S3 for trigger files written by parser.py after parsing is complete.
-# For each trigger, reads the parsed markdown and applies three chunking strategies:
-#   1. Section-aware  — splits on headings
-#   2. Type-aware     — separates text / tables / images into typed chunks
-#   3. Sliding window — overlapping windows on long text blocks
+# Stage 2: Polls the chunk-queue SQS, reads parsed markdown from S3,
+# applies chunking strategies, saves chunks to S3 (staging), then sends
+# the chunks S3 key to the embed-queue for Stage 3.
 
 import boto3
 import json
 import os
 import re
-import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-BUCKET       = "genai-rag-bucket-gd"
-TRIGGER_PREFIX = "dev/triggers/"
-CHUNKS_PREFIX  = "dev/chunks/"
-AWS_REGION   = os.getenv("AWS_REGION", "us-east-1")
-POLL_INTERVAL = 10       # seconds between scans
-CHUNK_SIZE    = 500      # words per sliding-window chunk
-CHUNK_OVERLAP = 50       # words of overlap between windows
+BUCKET          = "genai-rag-bucket-gd"
+CHUNKS_PREFIX   = "dev/chunks/"
+PARSED_PREFIX   = "dev/parsed/"
+CHUNK_QUEUE_URL = os.getenv("SQS_CHUNK_URL")
+EMBED_QUEUE_URL = os.getenv("SQS_EMBED_URL")
+AWS_REGION      = os.getenv("AWS_REGION", "us-east-1")
+CHUNK_SIZE      = 500
+CHUNK_OVERLAP   = 50
 
 
 # ── Typing ────────────────────────────────────────────────────────────────────
@@ -128,19 +126,17 @@ def chunk_markdown(markdown: str) -> list[dict]:
     return chunks
 
 
-# ── S3 polling loop ───────────────────────────────────────────────────────────
+# ── SQS loop ──────────────────────────────────────────────────────────────────
 
-def process_trigger(s3, trigger_key: str):
-    print(f"[TRIGGER] Found: s3://{BUCKET}/{trigger_key}")
+def process_message(s3, sqs, msg):
+    body       = json.loads(msg["Body"])
+    parsed_key = body["parsed_key"]
+    bucket     = body.get("bucket", BUCKET)
 
-    # Trigger file content = the parsed S3 key
-    obj = s3.get_object(Bucket=BUCKET, Key=trigger_key)
-    parsed_key = obj["Body"].read().decode("utf-8").strip()
-
-    print(f"[READ]    s3://{BUCKET}/{parsed_key}")
-    parsed_obj = s3.get_object(Bucket=BUCKET, Key=parsed_key)
-    data = json.loads(parsed_obj["Body"].read())
-    markdown = data.get("markdown", "")
+    print(f"[READ]    s3://{bucket}/{parsed_key}")
+    parsed_obj = s3.get_object(Bucket=bucket, Key=parsed_key)
+    data       = json.loads(parsed_obj["Body"].read())
+    markdown   = data.get("markdown", "")
 
     print(f"[CHUNK]   Chunking {parsed_key} ...")
     chunks = chunk_markdown(markdown)
@@ -149,27 +145,44 @@ def process_trigger(s3, trigger_key: str):
           f"{sum(1 for c in chunks if c['type']=='table')} table, "
           f"{sum(1 for c in chunks if c['type']=='image')} image)")
 
-    chunks_key = parsed_key.replace("dev/parsed/", CHUNKS_PREFIX)
+    chunks_key = parsed_key.replace(PARSED_PREFIX, CHUNKS_PREFIX)
     s3.put_object(
-        Bucket=BUCKET,
+        Bucket=bucket,
         Key=chunks_key,
         Body=json.dumps({"chunks": chunks}, ensure_ascii=False),
     )
-    print(f"[SAVED]   s3://{BUCKET}/{chunks_key}")
+    print(f"[SAVED]   s3://{bucket}/{chunks_key}")
 
-    # Write trigger for embedder
-    embed_trigger_key = "dev/triggers/embed/" + trigger_key.removeprefix(TRIGGER_PREFIX)
-    s3.put_object(Bucket=BUCKET, Key=embed_trigger_key, Body=chunks_key)
-    print(f"[TRIGGER] Embed trigger: s3://{BUCKET}/{embed_trigger_key}")
-
-    # Delete trigger so it's not processed again
-    s3.delete_object(Bucket=BUCKET, Key=trigger_key)
-    print(f"[DONE]    Trigger deleted: {trigger_key}\n")
+    sqs.send_message(
+        QueueUrl=EMBED_QUEUE_URL,
+        MessageBody=json.dumps({"chunks_key": chunks_key, "bucket": bucket}),
+    )
+    print(f"[QUEUE]   Sent to embed-queue: {chunks_key}\n")
 
 
 def poll():
-    s3 = boto3.client("s3", region_name=AWS_REGION)
-    print(f"[START] Chunker polling s3://{BUCKET}/{TRIGGER_PREFIX} every {POLL_INTERVAL}s")
+    s3  = boto3.client("s3", region_name=AWS_REGION)
+    sqs = boto3.client("sqs", region_name=AWS_REGION)
+    print(f"[START] Chunker polling chunk-queue: {CHUNK_QUEUE_URL}")
+
+    while True:
+        response = sqs.receive_message(
+            QueueUrl=CHUNK_QUEUE_URL,
+            MaxNumberOfMessages=5,
+            WaitTimeSeconds=10,
+        )
+        for msg in response.get("Messages", []):
+            try:
+                process_message(s3, sqs, msg)
+            except Exception as e:
+                print(f"[ERROR] {e}")
+            finally:
+                sqs.delete_message(QueueUrl=CHUNK_QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"])
+
+
+if __name__ == "__main__":
+    poll()
+
 
     while True:
         paginator = s3.get_paginator("list_objects_v2")
