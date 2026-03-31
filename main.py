@@ -185,6 +185,115 @@ def query(req: QueryRequest):
     )
 
 
+@app.post("/analyze")
+def analyze(mode: QueryMode = QueryMode.GROQ, filter_doc: str | None = None):
+    """
+    Pull all indexed financial chunks, summarise key numbers, then ask the
+    LLM to compute the 4 KPIs and return structured JSON + narrative.
+    """
+    scroll_filter = None
+    if filter_doc:
+        scroll_filter = Filter(
+            must=[FieldCondition(key="doc_title", match=MatchValue(value=filter_doc))]
+        )
+
+    pts, offset = [], None
+    while True:
+        result, offset = _qdrant.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=scroll_filter,
+            limit=250,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        pts.extend(result)
+        if offset is None:
+            break
+
+    if not pts:
+        raise HTTPException(status_code=404, detail="No documents indexed.")
+
+    # Collect table chunks (pipes = markdown tables from Textract)
+    table_chunks = [
+        p.payload.get("content", "")
+        for p in pts
+        if "|" in p.payload.get("content", "")
+    ][:40]  # cap to avoid token overflow
+
+    if not table_chunks:
+        # Fall back to all chunks
+        table_chunks = [p.payload.get("content", "") for p in pts][:30]
+
+    financial_data = "\n\n---\n\n".join(table_chunks)
+
+    system = "You are a senior financial analyst. Always follow the exact output format requested."
+
+    prompt = f"""You are a financial analyst.
+
+Given the following financial data, calculate and present insights for the following 4 KPIs:
+
+1. Revenue
+2. Net Profit Margin
+3. Operating Cash Flow
+4. Return on Investment (ROI)
+
+### Instructions:
+* Extract relevant values from the data
+* Compute each KPI using correct formulas
+* Show step-by-step calculations
+* Provide final values clearly
+
+### Output Format:
+
+#### 1. KPI Summary Table
+
+| KPI | Value | Insight |
+| --- | ----- | ------- |
+
+#### 2. Detailed Calculations
+
+* Revenue:
+* Net Profit Margin:
+* Operating Cash Flow:
+* ROI:
+
+#### 3. Insights
+
+* Explain trends
+* Highlight risks or growth
+
+#### 4. Charts
+
+Represent chart data in JSON format inside a ```json code block.
+Return exactly this structure with real numbers extracted from the data:
+
+```json
+[
+  {{"chart_type": "line", "title": "Revenue Trend", "x_axis": [], "y_axis": []}},
+  {{"chart_type": "bar", "title": "Profit Margin Comparison (%)", "x_axis": [], "y_axis": []}},
+  {{"chart_type": "line", "title": "Operating Cash Flow Over Time", "x_axis": [], "y_axis": []}},
+  {{"chart_type": "bar", "title": "ROI Comparison (%)", "x_axis": [], "y_axis": []}}
+]
+```
+
+### Financial Data:
+
+{financial_data}
+
+Ensure accurate calculations, clean structured output, and business-friendly explanations.
+"""
+
+    router   = get_router()
+    llm_resp = router.generate(prompt, mode=mode, system=system)
+
+    return {
+        "analysis": llm_resp.content,
+        "provider": llm_resp.provider,
+        "model":    llm_resp.model,
+    }
+
+
 @app.delete("/remove")
 def remove_all():
     """

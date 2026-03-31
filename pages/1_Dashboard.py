@@ -675,3 +675,78 @@ if seg_data:
 else:
     st.info("No geographic segment data found.")
 st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ── AI-Powered KPI Analysis ───────────────────────────────────────────────────
+import json as _json
+import requests as _requests
+
+st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+st.markdown('<div class="dash-section"><h3>AI-Powered KPI Analysis</h3><p class="section-sub">LLM-generated analysis: Revenue · Net Profit Margin · Operating Cash Flow · ROI</p>', unsafe_allow_html=True)
+
+_ai_col1, _ai_col2 = st.columns([3, 1])
+with _ai_col1:
+    _selected_doc = st.selectbox("Filter by document (optional)", ["All documents"] + docs, key="ai_doc_filter")
+with _ai_col2:
+    _ai_mode = st.radio("Model", ["Groq", "Gemini"], horizontal=True, key="ai_mode_radio")
+
+if st.button("Generate AI Analysis", type="primary", key="run_ai_analysis"):
+    _mode_val = "groq" if _ai_mode == "Groq" else "gemini"
+    _doc_param = None if _selected_doc == "All documents" else _selected_doc
+    _params = {"mode": _mode_val}
+    if _doc_param:
+        _params["filter_doc"] = _doc_param
+
+    with st.spinner("Analysing financial data with AI…"):
+        try:
+            _resp = _requests.post(f"{API_URL}/analyze", params=_params, timeout=120)
+            _resp.raise_for_status()
+            _result = _resp.json()
+            _analysis_text = _result["analysis"]
+            _provider_info = f"{_result['provider']} / {_result['model']}"
+        except Exception as _e:
+            st.error(f"Analysis failed: {_e}")
+            st.stop()
+
+    st.caption(f"Answered by: {_provider_info}")
+
+    # ── Split the response into sections and charts ───────────────────────
+    _chart_json = None
+    _text_part  = _analysis_text
+
+    # Extract the ```json block for charts
+    _json_match = re.search(r'```json\s*([\s\S]*?)```', _analysis_text)
+    if _json_match:
+        _text_part = _analysis_text[:_json_match.start()] + _analysis_text[_json_match.end():]
+        try:
+            _chart_json = _json.loads(_json_match.group(1).strip())
+        except _json.JSONDecodeError:
+            _chart_json = None
+
+    # Render the markdown narrative
+    st.markdown(_text_part)
+
+    # ── Render charts from JSON ───────────────────────────────────────────
+    if _chart_json and isinstance(_chart_json, list):
+        st.markdown("---")
+        st.markdown("**Generated Charts**")
+        _chart_cols = st.columns(2)
+        for _ci, _chart in enumerate(_chart_json):
+            _col = _chart_cols[_ci % 2]
+            with _col:
+                _title      = _chart.get("title", f"Chart {_ci+1}")
+                _x          = _chart.get("x_axis", [])
+                _y          = _chart.get("y_axis", [])
+                _chart_type = _chart.get("chart_type", "bar")
+                if _x and _y and len(_x) == len(_y):
+                    _df_chart = pd.DataFrame({"x": _x, _title: _y}).set_index("x")
+                    st.markdown(f'<p style="font-size:.82rem;font-weight:600;color:#475569;margin-bottom:4px;">{_title}</p>', unsafe_allow_html=True)
+                    if _chart_type == "line":
+                        st.line_chart(_df_chart)
+                    else:
+                        st.bar_chart(_df_chart)
+                else:
+                    st.caption(f"{_title}: no chart data returned")
+
+st.markdown('</div>', unsafe_allow_html=True)
+
